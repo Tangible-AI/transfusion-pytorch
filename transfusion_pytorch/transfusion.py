@@ -1827,31 +1827,38 @@ class Transfusion(Module):
                     new_kv_cache = None
 
                     use_cfg = cfg_scale != 1
+                    uncond_cache = None
 
                     if use_cfg:
-                        # prepare unconditional kv cache for CFG
-                        uncond_history = [] 
+                        # build the null-text (unconditional) history once
+                        uncond_history = []
 
                         for item in modality_sample:
                             if is_tensor(item) and item.dtype in (torch.int, torch.long):
                                 null_tokens = torch.full(
-                                    item.shape, 
-                                    self.null_text_id, 
-                                    dtype=item.dtype, 
+                                    item.shape,
+                                    self.null_text_id,
+                                    dtype=item.dtype,
                                     device=device
                                 )
                                 uncond_history.append(null_tokens)
                             else:
                                 uncond_history.append(item)
 
-                        with torch.no_grad():
-                            _, uncond_cache = self.forward(
-                                [uncond_history],
-                                return_loss = False,
-                                return_kv_cache = True,
-                                return_embed = True,
-                                decoding_text_or_modality = 'modality'
-                            )
+                        # only precompute an unconditional kv cache when kv-caching is enabled.
+                        # otherwise the uncond forward must run full (no cache) to mirror the
+                        # conditional path — passing a cache forces decode-mode slicing whose
+                        # rotary length won't match the (full) conditional q/k, which is the
+                        # source of the cfg_scale>1 rotary size-mismatch crash.
+                        if cache_kv:
+                            with torch.no_grad():
+                                _, uncond_cache = self.forward(
+                                    [uncond_history],
+                                    return_loss = False,
+                                    return_kv_cache = True,
+                                    return_embed = True,
+                                    decoding_text_or_modality = 'modality'
+                                )
 
                     def ode_step_fn(step_times, denoised):
                         nonlocal new_kv_cache
@@ -1893,7 +1900,7 @@ class Transfusion(Module):
                         )
 
                         parse_uncond = get_pred_flows_uncond[curr_modality_id][-1]
-                        parsed_uncond = parse_uncond(embeds_uncond, need_splice=True)
+                        parsed_uncond = parse_uncond(embeds_uncond, need_splice=not exists(uncond_cache))
                         uncond_flow = add_temp_batch_dim(mod.model_to_latent)(parsed_uncond)
 
                         final_flow = uncond_flow + cfg_scale * (cond_flow - uncond_flow)

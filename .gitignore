@@ -1,6 +1,24 @@
 data/mnist/
 results/
 
+# --- training data, run artifacts & caches (large; never commit) ---
+# (comments must be on their own line; trailing "# ..." would become part of the pattern)
+# checkpoints, wandb, samples, per-run slurm logs
+runs/
+# CC12M webdataset shards (~1.1TB); data/enwik8 + data/flowers stay tracked
+data/cc12m/
+data/coco/
+# COCO download + scratch space
+scratch/
+# HF model/tokenizer/VAE cache
+hf_cache/
+# checkpoints / offline wandb anywhere
+*.pt
+wandb/
+# SLURM stdout/stderr logs at repo root (tf_*, gpu_*, ...)
+*.out
+*.err
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
