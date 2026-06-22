@@ -10,7 +10,7 @@ Adapted from sweep_flowers.py's (correct) loop + phase1_coco.py's BPE tokenizer.
 Env: MODEL_SIZE DATA IMAGE_SIZE LR MIN_LR WARMUP TOTAL_STEPS BATCH_SIZE GRAD_ACCUM
      PROB_UNCOND OUTPUT_DIR RUN_NAME RESUME WANDB_PROJECT SAMPLE_EVERY CKPT_EVERY
 """
-import os, math, glob
+import os, math, glob, json
 from pathlib import Path
 import torch
 from torch import nn, tensor, Tensor
@@ -26,6 +26,7 @@ from einops import rearrange
 import wandb
 from transfusion_pytorch import Transfusion
 from cc12m_data import make_cc12m_loader, cycle
+from unet_patchifier import build_unet_patchifier
 
 # ---------------- DDP setup ----------------
 DDP_ON = 'RANK' in os.environ
@@ -64,11 +65,18 @@ if '*' in DATA:                                          # glob -> list of prese
     assert DATA, 'no shards matched DATA glob'
 RECON_W      = 0.1
 EMA_DECAY    = 0.999
+PATCHIFIER   = os.environ.get('PATCHIFIER', 'conv')      # 'conv' (stride-2) | 'unet' (diffusers down/up)
+BF16         = os.environ.get('BF16', '0') == '1'        # bf16 autocast (H100-native)
+amp = lambda: torch.autocast('cuda', dtype=torch.bfloat16, enabled=BF16)
 
 CKPT_DIR = Path(os.environ.get('OUTPUT_DIR', './runs/cc12m/run'));
 SAMPLES  = CKPT_DIR / 'samples'
 if IS_MAIN:
     CKPT_DIR.mkdir(parents=True, exist_ok=True); SAMPLES.mkdir(exist_ok=True, parents=True)
+    # record arch so eval_conditional_sweep.py can rebuild it exactly
+    json.dump(dict(model_size=MODEL_SIZE, image_size=IMAGE_SIZE, tokenizer='gpt2',
+                   patchifier=PATCHIFIER, bf16=BF16),
+              open(CKPT_DIR / 'config.json', 'w'), indent=2)
 
 # ---------------- BPE tokenizer (GPT-2, cached/offline) ----------------
 TOKENIZER       = AutoTokenizer.from_pretrained('gpt2')
@@ -90,6 +98,11 @@ class Decoder(Module):
 
 # ---------------- model ----------------
 tok_grid = IMAGE_SIZE // 8 // 2          # 16 at 256px -> 256 tokens (paper)
+if PATCHIFIER == 'unet':
+    enc_dec = build_unet_patchifier(latent_ch=LATENT_CH, dim=DIM)      # diffusers down/up blocks
+else:
+    enc_dec = (nn.Conv2d(LATENT_CH, DIM, 3, 2, 1),                     # stride-2 "linear" patchify
+               nn.ConvTranspose2d(DIM, LATENT_CH, 3, 2, 1, output_padding=1))
 model = Transfusion(
     num_text_tokens=NUM_TEXT_TOKENS,
     dim_latent=LATENT_CH,
@@ -97,10 +110,7 @@ model = Transfusion(
     modality_default_shape=(tok_grid, tok_grid),
     modality_encoder=Encoder(vae),
     modality_decoder=Decoder(vae),
-    pre_post_transformer_enc_dec=(
-        nn.Conv2d(LATENT_CH, DIM, 3, 2, 1),
-        nn.ConvTranspose2d(DIM, LATENT_CH, 3, 2, 1, output_padding=1),
-    ),
+    pre_post_transformer_enc_dec=enc_dec,
     add_pos_emb=False,
     modality_num_dim=2,
     reconstruction_loss_weight=RECON_W,
@@ -137,8 +147,9 @@ def conditioning_gap(n_batches=8):
         cor = [[t, im] for t, im in zip(texts, images)]
         shf = [[t, im] for t, im in zip(texts[1:] + texts[:1], images)]
         s = 1000 + b
-        torch.manual_seed(s); _, bdc = model(cor, return_breakdown=True)
-        torch.manual_seed(s); _, bdw = model(shf, return_breakdown=True)
+        with amp():
+            torch.manual_seed(s); _, bdc = model(cor, return_breakdown=True)
+            torch.manual_seed(s); _, bdw = model(shf, return_breakdown=True)
         cor_l.append(float(sum(bdc.flow))); wrong_l.append(float(sum(bdw.flow)))
     model.train()
     c = sum(cor_l) / len(cor_l); w = sum(wrong_l) / len(wrong_l)
@@ -172,11 +183,12 @@ for step in range(start_step, TOTAL_STEPS + 1):
         batch = next(it)
         # avoid redundant DDP allreduce on accumulation micro-steps
         if DDP_ON and micro < GRAD_ACCUM - 1:
-            with train_model.no_sync():
+            with train_model.no_sync(), amp():
                 loss, bd = train_model(batch, return_breakdown=True)
                 (loss / GRAD_ACCUM).backward()
         else:
-            loss, bd = train_model(batch, return_breakdown=True)
+            with amp():
+                loss, bd = train_model(batch, return_breakdown=True)
             (loss / GRAD_ACCUM).backward()
     gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)   # paper: clip 1.0
     opt.step(); opt.zero_grad(); sched.step(); ema_model.update()
@@ -202,7 +214,8 @@ for step in range(start_step, TOTAL_STEPS + 1):
             except Exception as e:
                 print(f'[cond-gap skipped at step {step}] {e}', flush=True)
             try:
-                u = ema_model.generate_modality_only(batch_size=4, modality_steps=16)
+                with amp():
+                    u = ema_model.generate_modality_only(batch_size=4, modality_steps=16)
                 save_image(rearrange(u, '(gh gw) c h w -> c (gh h) (gw w)', gh=2).detach().cpu(),
                            SAMPLES / f'{step}.png')
                 wandb.log({'samples_uncond': wandb.Image(str(SAMPLES / f'{step}.png'))}, step=step)

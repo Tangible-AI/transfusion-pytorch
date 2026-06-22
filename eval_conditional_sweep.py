@@ -16,7 +16,7 @@ Usage:
     PROMPTS="a red sports car;a cat wearing a hat;a mountain lake at sunset" \
     python eval_conditional_sweep.py runs/cc12m/p2_0.16B
 """
-import os, sys, glob, torch
+import os, sys, glob, json, torch
 import torch.nn.functional as F
 from pathlib import Path
 from torch import nn, tensor
@@ -26,19 +26,34 @@ from diffusers.models import AutoencoderKL
 from transfusion_pytorch import Transfusion
 
 DEVICE='cuda'; LATENT_CH = 4
-IMAGE_SIZE = int(os.environ.get('IMAGE_SIZE', 128))
+SWEEP = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ.get('SWEEP', './runs'))
+
+# auto-load the run's config.json (written by train_cc12m.py) for arch defaults; env overrides.
+def _load_cfg(root):
+    for c in [root / 'config.json', *sorted(root.glob('*/config.json'))]:
+        if c.exists():
+            print(f'using arch from {c}', flush=True)
+            return json.load(open(c))
+    return {}
+_CFG = _load_cfg(SWEEP)
+def _pick(env, key, default):           # precedence: env var > config.json > default
+    return os.environ.get(env) if os.environ.get(env) is not None else _CFG.get(key, default)
+
+IMAGE_SIZE = int(_pick('IMAGE_SIZE', 'image_size', 128))
 SIZES = {'0.16B': (768, 16, 12), '0.37B': (1024, 24, 16), '0.76B': (1536, 24, 24)}
-if os.environ.get('MODEL_SIZE') in SIZES:
-    DIM, DEPTH, HEADS = SIZES[os.environ['MODEL_SIZE']]
+_ms = _pick('MODEL_SIZE', 'model_size', None)
+if _ms in SIZES:
+    DIM, DEPTH, HEADS = SIZES[_ms]
 else:
     DIM   = int(os.environ.get('DIM', 128))
     DEPTH = int(os.environ.get('DEPTH', 8))
     HEADS = int(os.environ.get('HEADS', 8))
-DH    = int(os.environ.get('DH', 64))
+DH         = int(os.environ.get('DH', 64))
+PATCHIFIER = _pick('PATCHIFIER', 'patchifier', 'conv')
 CFG_SCALES = [float(x) for x in os.environ.get('CFG_SCALES', '1.0,3.0').split(',')]
 
 # tokenizer: byte-level (flowers) or GPT-2 BPE (CC12M/COCO)
-if os.environ.get('TOKENIZER', 'byte') == 'gpt2':
+if _pick('TOKENIZER', 'tokenizer', 'byte') == 'gpt2':
     from transformers import AutoTokenizer
     _TOK = AutoTokenizer.from_pretrained('gpt2')
     NUM_TEXT_TOKENS = _TOK.vocab_size
@@ -50,8 +65,6 @@ else:
 _default_prompts = ['sunflower', 'rose', 'water lily', 'pink primrose',
                     'daffodil', 'tiger lily', 'globe thistle', 'bird of paradise']
 PROMPTS = [p.strip() for p in os.environ['PROMPTS'].split(';')] if os.environ.get('PROMPTS') else _default_prompts
-
-SWEEP = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ.get('SWEEP', './runs'))
 
 vae = AutoencoderKL.from_pretrained('stabilityai/sd-vae-ft-mse').requires_grad_(False).eval()
 class Enc(Module):
@@ -66,10 +79,15 @@ class Dec(Module):
 
 def build_model():
     tok = IMAGE_SIZE // 8 // 2
+    if PATCHIFIER == 'unet':
+        from unet_patchifier import build_unet_patchifier
+        enc_dec = build_unet_patchifier(latent_ch=LATENT_CH, dim=DIM)
+    else:
+        enc_dec = (nn.Conv2d(LATENT_CH, DIM, 3, 2, 1),
+                   nn.ConvTranspose2d(DIM, LATENT_CH, 3, 2, 1, output_padding=1))
     return Transfusion(num_text_tokens=NUM_TEXT_TOKENS, dim_latent=LATENT_CH, channel_first_latent=True,
         modality_default_shape=(tok, tok), modality_encoder=Enc(vae), modality_decoder=Dec(vae),
-        pre_post_transformer_enc_dec=(nn.Conv2d(LATENT_CH, DIM, 3, 2, 1),
-                                      nn.ConvTranspose2d(DIM, LATENT_CH, 3, 2, 1, output_padding=1)),
+        pre_post_transformer_enc_dec=enc_dec,
         add_pos_emb=False, modality_num_dim=2, reconstruction_loss_weight=0.1,
         transformer=dict(dim=DIM, depth=DEPTH, dim_head=DH, heads=HEADS)).to(DEVICE)
 
